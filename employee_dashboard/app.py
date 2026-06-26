@@ -1,9 +1,92 @@
+import os
+import json
+
 import pandas as pd
+import requests
 import streamlit as st
 import plotly.express as px
 from pathlib import Path
 
 st.set_page_config(page_title="EV Charge Advisor", layout="wide")
+
+# NextEra Energy brand palette (sourced from nexteraenergy.com).
+NEXTERA_NAVY = "#0c2739"
+NEXTERA_BLUE = "#0073A8"
+NEXTERA_BLUE_LIGHT = "#1484ba"
+NEXTERA_GREEN = "#447b2d"
+NEXTERA_RED = "#a94442"
+CONGESTION_COLORS = {
+    "Low": NEXTERA_GREEN,
+    "Medium": NEXTERA_BLUE,
+    "High": NEXTERA_RED,
+}
+
+st.markdown(
+    f"""
+    <style>
+      /* ── NextEra-branded header band ───────────────────────────── */
+      .nee-header {{
+        background: linear-gradient(100deg, {NEXTERA_NAVY} 0%, {NEXTERA_BLUE} 100%);
+        border-bottom: 4px solid {NEXTERA_GREEN};
+        border-radius: 8px;
+        padding: 22px 28px;
+        margin-bottom: 26px;
+      }}
+      .nee-header .nee-logo {{
+        color: #ffffff;
+        font-size: 0.82rem;
+        font-weight: 700;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        opacity: 0.92;
+      }}
+      .nee-header .nee-logo span {{ color: {NEXTERA_GREEN}; }}
+      .nee-header h1 {{
+        color: #ffffff;
+        font-size: 2.05rem;
+        font-weight: 700;
+        margin: 6px 0 4px 0;
+        padding: 0;
+      }}
+      .nee-header p {{
+        color: #d6e6ef;
+        font-size: 0.98rem;
+        margin: 0;
+      }}
+
+      /* ── Section headings: navy with a green accent bar ─────────── */
+      .block-container h2, .block-container h3 {{
+        color: {NEXTERA_NAVY};
+        border-left: 4px solid {NEXTERA_GREEN};
+        padding-left: 10px;
+      }}
+
+      /* ── Metric cards ──────────────────────────────────────────── */
+      [data-testid="stMetric"] {{
+        background: #ffffff;
+        border: 1px solid #dbe5ec;
+        border-top: 3px solid {NEXTERA_BLUE};
+        border-radius: 6px;
+        padding: 14px 16px;
+        box-shadow: 0 1px 3px rgba(12, 39, 57, 0.07);
+      }}
+      [data-testid="stMetricValue"] {{ color: {NEXTERA_BLUE}; }}
+
+      /* ── Sidebar heading accent ────────────────────────────────── */
+      [data-testid="stSidebar"] h2 {{
+        color: {NEXTERA_NAVY};
+        border-left: 4px solid {NEXTERA_GREEN};
+        padding-left: 10px;
+      }}
+
+      /* ── AI explanation (info box) in NextEra blue ─────────────── */
+      [data-testid="stAlert"] {{
+        border-left: 5px solid {NEXTERA_BLUE};
+      }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 DATA_PATH = Path(__file__).parent / "chargepoint_sessions.csv"
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -189,12 +272,143 @@ def explain_recommendation(office, day, selected_hour, selected_row, window):
     )
 
 
+OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2")
+# Ollama is local — never route these calls through a corporate HTTP(S) proxy.
+NO_PROXY = {"http": None, "https": None}
+
+
+def ollama_models():
+    """Return the list of locally available Ollama model names ([] if unreachable)."""
+    try:
+        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=2, proxies=NO_PROXY)
+        r.raise_for_status()
+        return [m["name"] for m in r.json().get("models", [])]
+    except Exception:
+        return []
+
+
+def stream_ollama(model, system, messages):
+    """Yield assistant text chunks from a local Ollama model (streaming chat)."""
+    payload = {
+        "model": model,
+        "messages": [{"role": "system", "content": system}] + messages,
+        "stream": True,
+    }
+    with requests.post(
+        f"{OLLAMA_URL}/api/chat", json=payload, stream=True, timeout=120, proxies=NO_PROXY
+    ) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            data = json.loads(line)
+            chunk = data.get("message", {}).get("content", "")
+            if chunk:
+                yield chunk
+            if data.get("done"):
+                break
+
+
+def build_assistant_context(office, day, selected_hour, selected_row, window, chart_df):
+    """System prompt: who the assistant is, plus a snapshot of the user's current view."""
+    lines = [
+        "You are the EV Charge Advisor assistant for NextEra Energy, helping employees "
+        "plan when to charge their electric vehicles at the workplace.",
+        "",
+        "Use the live context below to answer questions about the current forecast and "
+        "recommendation. You can also answer general questions on any topic. Be concise, "
+        "friendly, and practical. When you use the data, explain it in plain language.",
+        "",
+        "Methodology: congestion is estimated from charger occupancy over time — each session "
+        "is spread across every hour the car stays plugged in (Total Duration), so a car that "
+        "plugs in at 7 AM and unplugs at 11 AM counts against 7-10 AM. Figures reflect historical "
+        "patterns, not live telemetry, and cover only a sample of the site's chargers, so treat "
+        "them as relative demand patterns and estimated availability.",
+        "",
+        "=== CURRENT VIEW ===",
+        f"Office: {office}",
+        f"Day: {day}",
+        f"Planned arrival time: {format_hour(selected_hour)}",
+        f"Forecasted congestion at arrival: {selected_row['congestion_level']}",
+        f"Estimated availability at arrival: {selected_row['availability_probability']:.0%}",
+    ]
+    if window:
+        lines.append(
+            f"Recommended charging window: {format_hour(window['start_hour'])}–"
+            f"{format_hour(window['end_hour'])} (estimated availability "
+            f"{window['avg_probability']:.0%})"
+        )
+    lines.append("")
+    lines.append("Hourly forecast for the selected day (hour | congestion | congestion % | est. availability):")
+    for _, r in chart_df.iterrows():
+        lines.append(
+            f"- {r['hour_label']} | {r['congestion_level']} | "
+            f"{r['congestion_pct']:.0f}% | {r['availability_probability']:.0%}"
+        )
+    return "\n".join(lines)
+
+
+def render_chatbot(context):
+    """Streaming chat UI backed by a local Ollama model."""
+    st.markdown("**Ask the assistant**")
+    st.caption("Ask about this forecast, the recommendation, or anything else.")
+
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = []
+
+    models = ollama_models()
+    if not models:
+        st.info(
+            "The local AI assistant isn't available. Make sure Ollama is running "
+            "(`ollama serve`) and a model is installed (`ollama pull llama3.2`)."
+        )
+        return
+
+    model = st.session_state.get("ollama_model")
+    if model not in models:
+        model = DEFAULT_MODEL if DEFAULT_MODEL in models else models[0]
+
+    for msg in st.session_state.chat_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    prompt = st.chat_input("Ask about your charging forecast…")
+    if not prompt:
+        return
+
+    st.session_state.chat_messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        try:
+            history = [
+                {"role": m["role"], "content": m["content"]}
+                for m in st.session_state.chat_messages
+            ]
+            response = st.write_stream(stream_ollama(model, context, history))
+        except Exception as e:
+            response = f"Sorry, I couldn't reach the local AI model: {e}"
+            st.error(response)
+
+    st.session_state.chat_messages.append({"role": "assistant", "content": response})
+
+
 df = load_data()
 occ_table = build_occupancy_table(df)
 offices = sorted(occ_table["office"].dropna().unique())
 
-st.title("EV Charge Advisor")
-st.caption("AI-powered workplace charging demand forecast based on historical charging sessions")
+st.markdown(
+    """
+    <div class="nee-header">
+      <div class="nee-logo">NextEra Energy<span>&#174;</span></div>
+      <h1>EV Charge Advisor</h1>
+      <p>AI-powered workplace charging demand forecast based on historical charging sessions</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 with st.sidebar:
     st.header("Plan your charge")
@@ -205,6 +419,17 @@ with st.sidebar:
         "Hours you're flexible to charge between", 5, 20, (8, 17), format="%d:00"
     )
     window_hours = st.slider("Hours you need to charge", 1, 6, 2, format="%d hr")
+
+    _models = ollama_models()
+    if _models:
+        st.divider()
+        _default_idx = _models.index(DEFAULT_MODEL) if DEFAULT_MODEL in _models else 0
+        st.session_state.ollama_model = st.selectbox(
+            "Assistant model (local)",
+            _models,
+            index=_default_idx,
+            help="Runs locally via Ollama — no API key or internet needed.",
+        )
 
 hourly = build_hourly_table(occ_table, office)
 day_df = hourly[hourly["day_name"] == day].copy()
@@ -233,15 +458,28 @@ fig = px.bar(
     y="congestion_pct",
     color="congestion_level",
     category_orders={"hour_label": hour_order, "congestion_level": ["Low", "Medium", "High"]},
+    color_discrete_map=CONGESTION_COLORS,
     labels={"hour_label": "Hour", "congestion_pct": "Congestion (%)", "congestion_level": "Congestion"},
     title="Forecasted congestion by hour",
 )
 fig.update_yaxes(range=[0, 100])
+fig.update_layout(
+    font_color=NEXTERA_NAVY,
+    title_font_color=NEXTERA_NAVY,
+    plot_bgcolor="white",
+    paper_bgcolor="white",
+    legend_title_font_color=NEXTERA_NAVY,
+)
+fig.update_xaxes(gridcolor="#e6edf2")
+fig.update_yaxes(gridcolor="#e6edf2")
 st.plotly_chart(fig, use_container_width=True)
 
-st.subheader("AI explanation")
-if window:
-    st.info(explain_recommendation(office, day, selected_hour, selected_row, window))
+with st.container(border=True):
+    st.subheader("AI explanation")
+    if window:
+        st.markdown(explain_recommendation(office, day, selected_hour, selected_row, window))
+    st.divider()
+    render_chatbot(build_assistant_context(office, day, selected_hour, selected_row, window, chart_df))
 
 st.subheader("Daily details")
 rec_hours = set(range(window["start_hour"], window["end_hour"])) if window else set()
