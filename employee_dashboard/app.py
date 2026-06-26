@@ -365,32 +365,34 @@ def render_chatbot(context):
         )
         return
 
-    model = st.session_state.get("ollama_model")
-    if model not in models:
-        model = DEFAULT_MODEL if DEFAULT_MODEL in models else models[0]
+    model = DEFAULT_MODEL if DEFAULT_MODEL in models else models[0]
 
-    for msg in st.session_state.chat_messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+    # Fixed-height, scrollable chat area so the conversation stays inside the box
+    # and scrolls internally instead of extending the page with each message.
+    chat_box = st.container(height=320)
+    with chat_box:
+        for msg in st.session_state.chat_messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
 
     prompt = st.chat_input("Ask about your charging forecast…")
     if not prompt:
         return
 
     st.session_state.chat_messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    with st.chat_message("assistant"):
-        try:
-            history = [
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.chat_messages
-            ]
-            response = st.write_stream(stream_ollama(model, context, history))
-        except Exception as e:
-            response = f"Sorry, I couldn't reach the local AI model: {e}"
-            st.error(response)
+    with chat_box:
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        with st.chat_message("assistant"):
+            try:
+                history = [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in st.session_state.chat_messages
+                ]
+                response = st.write_stream(stream_ollama(model, context, history))
+            except Exception as e:
+                response = f"Sorry, I couldn't reach the local AI model: {e}"
+                st.error(response)
 
     st.session_state.chat_messages.append({"role": "assistant", "content": response})
 
@@ -414,22 +416,19 @@ with st.sidebar:
     st.header("Plan your charge")
     office = st.selectbox("Office", offices)
     day = st.selectbox("Day", DAYS[:5], index=2)
-    selected_hour = st.slider("What time would you arrive?", 5, 19, 9, format="%d:00")
-    start_hour, end_hour = st.slider(
-        "Hours you're flexible to charge between", 5, 20, (8, 17), format="%d:00"
+    selected_hour = st.select_slider(
+        "What time would you arrive?",
+        options=list(range(5, 20)),
+        value=9,
+        format_func=format_hour,
+    )
+    start_hour, end_hour = st.select_slider(
+        "Hours you're flexible to charge between",
+        options=list(range(5, 21)),
+        value=(8, 17),
+        format_func=format_hour,
     )
     window_hours = st.slider("Hours you need to charge", 1, 6, 2, format="%d hr")
-
-    _models = ollama_models()
-    if _models:
-        st.divider()
-        _default_idx = _models.index(DEFAULT_MODEL) if DEFAULT_MODEL in _models else 0
-        st.session_state.ollama_model = st.selectbox(
-            "Assistant model (local)",
-            _models,
-            index=_default_idx,
-            help="Runs locally via Ollama — no API key or internet needed.",
-        )
 
 hourly = build_hourly_table(occ_table, office)
 day_df = hourly[hourly["day_name"] == day].copy()
